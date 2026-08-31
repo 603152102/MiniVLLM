@@ -22,7 +22,7 @@ config = {
     'max_cached_blocks': 1024,
     'block_size': 256,
     'world_size': 1,
-    'model_name_or_path': 'Qwen/Qwen3-0.6B',
+    'model_name_or_path': '/home/MiniVllm/MinivLLM/models/Qwen3-0.6B',
     'enforce_eager': True,
     'vocab_size': 151936,  # Fixed: was 151643, HF model uses 151936
     'hidden_size': 1024,
@@ -44,7 +44,7 @@ config = {
     'eos': 151645,  # Fixed: should match tokenizer.eos_token_id
 }
 
-MODEL_NAME = "Qwen/Qwen3-0.6B"
+MODEL_NAME = "/home/MiniVllm/MinivLLM/models/Qwen3-0.6B"
 PROMPTS = [
     "introduce yourself" ,
     "list all prime numbers within 100" ,
