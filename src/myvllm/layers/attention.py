@@ -24,7 +24,7 @@ def store_kvcache_kernel(
     # thread ID, in dimension 0
     token_idx = tl.program_id(0) # each GPU thread processes one token
     # slot ID, where in cache to store this token
-    slot_idx = tl.load(slot_mapping_ptr + token_idx)
+    slot_idx = tl.load(slot_mapping_ptr + token_idx)# slot_mapping[token_idx] 的地址
     
     if slot_idx == -1:
         return
@@ -51,11 +51,14 @@ def store_kvcache_kernel(
 
     # Cache: (num_blocks, block_size, num_kv_heads, head_dim)
     cache_offset = (block_idx * block_size * num_kv_heads * head_dim + # skip previous blocks
-                   block_offset * num_kv_heads * head_dim + # skip previous positions in block
-                   head_idx * head_dim + # skip previous heads
+                   block_offset * num_kv_heads * head_dim + # skip previous positions / token in block
+                   head_idx * head_dim + # skip previous kv heads
                    head_offsets) 
     
     # load key and value value floats from the pointers's memory
+    #     CUDA                       Triton
+    # x = ptr[offset]     ≈      x = tl.load(ptr + offset)
+    # ptr[offset] = x     ≈      tl.store(ptr + offset, x)
     key = tl.load(key_ptr + input_offset)
     value = tl.load(value_ptr + input_offset)
     
@@ -123,7 +126,7 @@ def flash_attention_varlen_kernel(
     Flash Attention kernel for variable-length sequences.
     Each program processes one block of queries for one head in one sequence.
     """
-    # Program IDs
+    # Program IDs / Block xyz
     start_m = tl.program_id(0) # block index
     off_h = tl.program_id(1) # head index
     seq_idx = tl.program_id(2) # sequence index
@@ -141,8 +144,8 @@ def flash_attention_varlen_kernel(
         return
     
     # Offset for this block of queries
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, head_dim)
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M) #负责seq中的哪些token
+    offs_d = tl.arange(0, head_dim)                    #负责head里的哪些维度
     
     # Query pointers: Q has shape (total_tokens, num_heads, head_dim)
     q_ptrs = Q + (seq_start + offs_m[:, None]) * num_heads * head_dim + off_h * head_dim + offs_d[None, :]
