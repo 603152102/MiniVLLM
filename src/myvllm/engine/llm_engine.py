@@ -72,9 +72,10 @@ class LLMEngine:
             return [], num_processed_tokens, is_prefill
         # run the model
         outputs = self.model_runner.call("run", scheduled_sequences, is_prefill)
+        if outputs is None:
+            raise RuntimeError("ModelRunner.run() returned no outputs")
         # Move outputs to CPU and convert them to a list
-        if outputs is not None:
-            outputs = outputs.cpu().tolist()
+        outputs = outputs.cpu().tolist()
         # postprocess the outputs
         self.scheduler.postprocess(scheduled_sequences, outputs)
 

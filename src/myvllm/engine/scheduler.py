@@ -63,7 +63,7 @@ class Scheduler:
                     self.running.appendleft(seq)
                     self.preempt(self.running.pop())
                 else:
-                    self.preempt(seq)
+                    self.preempt(seq)   #没有多余的队列可以释放
                     break
             else:
                 if current_scheduled_tokens >= self.max_num_batched_tokens or len(scheduled_sequences) >= self.max_num_sequences:

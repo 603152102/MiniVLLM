@@ -7,7 +7,7 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from myvllm.models.qwen3 import Qwen3ForCausalLM
-from myvllm.models.llama import LlamaForCausalLM
+#from myvllm.models.llama import LlamaForCausalLM
 from myvllm.layers.sampler import SamplerLayer
 from myvllm.engine.sequence import Sequence
 from myvllm.utils import *
@@ -171,7 +171,7 @@ class ModelRunner:
     # will be called by both rank == 0 and rank != 0
     # given method name and args from shared memory
     # execute the method and return results
-    def call(self, method_name: str, *args: dict):
+    def call(self, method_name: str, *args: object):
         if self.world_size > 1 and self.rank == 0: # will be called in main engine
             self.write_shm(method_name, args)
         method = getattr(self, method_name, None)
