@@ -105,9 +105,9 @@ def store_kvcache(
         k_cache,
         v_cache,
         slot_mapping,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        block_size=block_size
+        num_kv_heads=tl.constexpr(num_kv_heads),
+        head_dim=tl.constexpr(head_dim),
+        block_size=tl.constexpr(block_size)
     )
 
 
@@ -185,9 +185,12 @@ def flash_attention_varlen_kernel(
         qk = tl.where(mask_causal & mask_n[None, :], qk, -1e10)
         
         # Online softmax update
+        # m_ij     = 当前 block 最大值
+        # m_i      = 历史最大值
+        # m_i_new  = 加上当前 block 后的总最大值
         m_ij = tl.max(qk, axis=1)
         m_i_new = tl.maximum(m_i, m_ij)
-        alpha = tl.exp(m_i - m_i_new)
+        alpha = tl.exp(m_i - m_i_new)   #新旧坐标转换的缩放系数
         p = tl.exp(qk - m_i_new[:, None])
         
         # Rescale previous accumulator
@@ -273,11 +276,11 @@ def flash_attention_prefill(
         q, k, v, output,
         cu_seqlens,
         scale,
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
+        num_heads=tl.constexpr(num_heads),
+        num_kv_heads=tl.constexpr(num_kv_heads),
+        head_dim=tl.constexpr(head_dim),
+        BLOCK_M=tl.constexpr(BLOCK_M),
+        BLOCK_N=tl.constexpr(BLOCK_N),
     )
     
     return output
@@ -443,13 +446,13 @@ def paged_attention_decode(
         v_cache,
         block_tables,
         context_lens,
-        scale=scale,
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        block_size=block_size,
-        max_num_blocks=max_num_blocks,
-        BLOCK_N=BLOCK_N,
+        scale=tl.constexpr(scale),
+        num_heads=tl.constexpr(num_heads),
+        num_kv_heads=tl.constexpr(num_kv_heads),
+        head_dim=tl.constexpr(head_dim),
+        block_size=tl.constexpr(block_size),
+        max_num_blocks=tl.constexpr(max_num_blocks),
+        BLOCK_N=tl.constexpr(BLOCK_N),
     )
     
     return output
@@ -461,7 +464,7 @@ class Attention(nn.Module):
         num_heads: int,
         head_dim: int,
         scale: float = 1.0,
-        num_kv_heads: int = None,
+        num_kv_heads: int | None = None,
         block_size: int = 16,
     ):
         super().__init__()
@@ -505,6 +508,10 @@ class Attention(nn.Module):
             # Output: (total_tokens, num_heads, head_dim) -> (total_tokens, num_heads * head_dim)
             return o.reshape(o.shape[0], self.num_heads * self.head_dim)
         else:
+            if context.block_tables is None:
+                raise ValueError("block_tables must be provided for paged attention")
+            if context.context_lens is None:
+                raise ValueError("context_lens must be provided for paged attention")
             o = paged_attention_decode(
                 q, 
                 k_cache, 
