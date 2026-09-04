@@ -8,6 +8,7 @@ from myvllm.sampling_parameters import SamplingParams
 from transformers import AutoTokenizer
 
 CHUNKED = "--chunked" in sys.argv
+PROFILE = "--profile" in sys.argv
 BUDGET = 16 if CHUNKED else 1024
 
 config = {
@@ -51,9 +52,29 @@ prompt = tokenizer.apply_chat_template(
     tokenize=False,
     add_generation_prompt=True,
 )
-out = llm.generate([prompt], SamplingParams(temperature=0.6, max_tokens=48, max_model_length=256))
+sampling_params = SamplingParams(temperature=0.6, max_tokens=48, max_model_length=256)
+if PROFILE:
+    # 性能分析模式：只 profile 前 8 步（覆盖慢的 prefill/decode 第一步，同时
+    # 避免全程记录把内存吃爆——之前全量 generate() 被 OOM kill 过），导出
+    # chrome trace，在浏览器 chrome://tracing 里拖入 trace 文件即可看火焰图
+    # （X 轴 = 时间，Y 轴 = 调用层级，条宽 = 耗时）
+    from torch.profiler import profile, ProfilerActivity
+    llm.add_prompt(prompt, sampling_params)
+    # NOTE: 不要开 with_stack=True——每个事件都会存一整条 Python 调用栈，
+    # 在这台机器上会把 WSL 内存吃爆被 OOM kill（exit 137）
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        for _ in range(8):
+            llm.step()
+    trace_path = f"trace_{'chunked' if CHUNKED else 'legacy'}.json"
+    prof.export_chrome_trace(trace_path)
+    print(f"chrome trace exported to: {trace_path}")
+    print("open it at chrome://tracing to see the flame graph")
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
+else:
+    out = llm.generate([prompt], sampling_params)
 print(f"mode={'CHUNKED' if CHUNKED else 'LEGACY'} budget={BUDGET}")
 print("PROMPT TOKENS:", len(tokenizer.encode(prompt)))
 print("PROMPT TEXT:", prompt)
-print("OUTPUT TOKENS:", out['token_ids'][0])
-print("OUTPUT TEXT:", out['text'][0])
+if not PROFILE:
+    print("OUTPUT TOKENS:", out['token_ids'][0])
+    print("OUTPUT TEXT:", out['text'][0])

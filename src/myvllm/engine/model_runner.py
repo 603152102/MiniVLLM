@@ -91,6 +91,11 @@ class ModelRunner:
         self.warmup_model()
         # allocate kv cache
         self.allocate_kv_cache()
+        # warm up the paths warmup_model cannot reach: decode (paged decode
+        # kernel) and chunked prefill (paged prefill kernel) both need the KV
+        # cache, so their JIT compilation would otherwise hit the first real
+        # step of the first request
+        self.warmup_decode_and_chunked()
         # capture cuda graph for decoding
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -200,6 +205,45 @@ class ModelRunner:
         #         )
         #     )
         self.run(seqs, is_prefill=True)
+        torch.cuda.empty_cache()
+
+    # warm up the decode path (paged decode kernel + sampler in decode shape)
+    # and the chunked prefill path (paged prefill kernel) with fake sequences
+    # whose block tables point into the just-allocated KV cache, so that all
+    # Triton JIT compilation and the sampler's torch.compile happen at init
+    # time instead of during the first real request.
+    # NOTE: max_num_blocks is a constexpr in both paged kernels, so each
+    # distinct value compiles a separate kernel instance. Warm up both the
+    # common case (1 block) and the longest sequence the config allows, or a
+    # real request with a different block count would still pay a fresh
+    # compile on its first step.
+    def warmup_decode_and_chunked(self):
+        # run eagerly even when cuda graphs are enabled: the graphs are not
+        # captured yet at this point, and the goal is only to compile the
+        # kernels, which graph capture later reuses
+        enforce_eager = self.enforce_eager
+        self.enforce_eager = True
+        try:
+            block_size = self.block_size
+            max_blocks = math.ceil(self.config['max_model_length'] / block_size)
+            for num_blocks in sorted({1, max_blocks}):
+                seq_len = num_blocks * block_size
+                # decode path: one token per sequence, paged decode kernel
+                # reads the block table, sampler compiles for its decode shape
+                seq = Sequence(token_ids=[0] * seq_len, block_size=block_size)
+                seq.block_table = list(range(num_blocks))
+                self.run([seq], is_prefill=False)
+                # chunked prefill path: a chunk that follows an already
+                # computed prefix, so cu_seqlens_q < cu_seqlens_k and the
+                # paged prefill kernel runs
+                half = block_size // 2
+                seq = Sequence(token_ids=[0] * seq_len, block_size=block_size)
+                seq.block_table = list(range(num_blocks))
+                seq.num_computed_tokens = seq_len - half
+                seq.num_prefill_chunk_tokens = half
+                self.run([seq], is_prefill=True)
+        finally:
+            self.enforce_eager = enforce_eager
         torch.cuda.empty_cache()
 
     # allocate kv cache memory blocks for model
