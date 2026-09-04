@@ -83,14 +83,20 @@ class LLMEngine:
             raise RuntimeError("ModelRunner.run() returned no outputs")
         # Move outputs to CPU and convert them to a list
         outputs = outputs.cpu().tolist()
+        # count before postprocess: it zeroes num_prefill_chunk_tokens
+        if is_prefill:
+            # a chunked step processes its chunk; an unchunked (legacy) step
+            # processes the whole remaining prompt
+            num_processed_tokens = sum(
+                seq.num_prefill_chunk_tokens if seq.num_prefill_chunk_tokens > 0 else len(seq) - seq.num_cached_tokens
+                for seq in scheduled_sequences
+            )
+        else:
+            num_processed_tokens = len(scheduled_sequences)
         # postprocess the outputs
         self.scheduler.postprocess(scheduled_sequences, outputs)
 
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in scheduled_sequences if seq.is_finished]
-        # NOTE: under chunked prefill this counts whole prompts per chunk step
-        # (overcounting the tokens actually processed); it only feeds the
-        # throughput print in generate(), fix alongside the runner changes.
-        num_processed_tokens = sum(len(seq) for seq in scheduled_sequences) if is_prefill else len(scheduled_sequences)
 
         return outputs, num_processed_tokens, is_prefill
 
