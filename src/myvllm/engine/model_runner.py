@@ -48,23 +48,23 @@ class ModelRunner:
                     tie_word_embeddings=config['tie_word_embeddings'],
                     block_size=self.block_size,
                 )
-            case 'Llama-3.2-1B-Instruct':
-                self.model = LlamaForCausalLM(
-                    vocab_size=config['vocab_size'],
-                    hidden_size=config['hidden_size'],
-                    head_dim=config['head_dim'],
-                    num_qo_heads=config['num_qo_heads'],
-                    num_kv_heads=config['num_kv_heads'],
-                    has_attn_bias=config['has_attn_bias'],
-                    rms_norm_epsilon=config['rms_norm_epsilon'],
-                    rope_base=config['rope_base'],
-                    max_position_embeddings=config['max_position_embeddings'],
-                    intermediate_size=config['intermediate_size'],
-                    ffn_bias=config['ffn_bias'],
-                    num_layers=config['num_layers'],
-                    block_size=self.block_size,
-                    tie_word_embeddings=config['tie_word_embeddings'],
-                )
+            # case 'Llama-3.2-1B-Instruct':
+            #     self.model = LlamaForCausalLM(
+            #         vocab_size=config['vocab_size'],
+            #         hidden_size=config['hidden_size'],
+            #         head_dim=config['head_dim'],
+            #         num_qo_heads=config['num_qo_heads'],
+            #         num_kv_heads=config['num_kv_heads'],
+            #         has_attn_bias=config['has_attn_bias'],
+            #         rms_norm_epsilon=config['rms_norm_epsilon'],
+            #         rope_base=config['rope_base'],
+            #         max_position_embeddings=config['max_position_embeddings'],
+            #         intermediate_size=config['intermediate_size'],
+            #         ffn_bias=config['ffn_bias'],
+            #         num_layers=config['num_layers'],
+            #         block_size=self.block_size,
+            #         tie_word_embeddings=config['tie_word_embeddings'],
+            #     )
             case _:
                 raise Exception(f"Unsupported model: {config['model_name_or_path']}")
 
@@ -263,8 +263,11 @@ class ModelRunner:
 
     # given seqs
     # prepare the data needed for a prefill forward pass
-    # taking prefix cache into consideration: 
+    # taking prefix cache and chunked prefill into consideration:
     # input_ids, positions, cu_seqlens_q/k, slot_mapping (where to write new KV values), block_tables (where to read KV values)
+    # for chunked prefill each sequence computes only the chunk stamped in
+    # num_prefill_chunk_tokens; a stamp of 0 means no chunking (legacy
+    # scheduler / warmup), so the rest of the prompt is computed in one pass
     # cu_seqlens_q = [0, 3, 5, 9]
     #               │  │  │  │
     #               │  │  │  └─ end of seq3 (position 9)
@@ -272,9 +275,12 @@ class ModelRunner:
     #               │  └─────── end of seq1 (position 3)
     #               └────────── start (position 0)
     def prepare_prefill(self, seqs: list[Sequence]) -> torch.Tensor:
-        # length: sum of all input_ids after prefix cache
+        # length: sum of all chunk lengths after prefix cache
         input_ids = []
-        # length: sum of all input_ids after prefix cache
+        # absolute RoPE position of every new token: a chunk continues the
+        # prompt, so its positions do not restart at 0
+        positions = []
+        # length: sum of all chunk lengths after prefix cache
         slot_mappings = []
         # length: num_seqs
         seqlens_q = []
@@ -288,18 +294,27 @@ class ModelRunner:
         block_tables = []
         for seq in seqs:
             token_ids = seq.token_ids
-            num_cached_tokens = seq.num_cached_tokens
-            input_ids.extend(token_ids[num_cached_tokens:])
-            seqlens_q.append(len(token_ids) - num_cached_tokens)
-            seqlens_k.append(len(token_ids))
+            start = seq.num_cached_tokens + seq.num_computed_tokens
+            if seq.num_prefill_chunk_tokens > 0:
+                end = start + seq.num_prefill_chunk_tokens
+            else:
+                # no chunk stamped: prefill everything that remains
+                end = len(token_ids)
+            input_ids.extend(token_ids[start:end])
+            positions.extend(range(start, end))
+            # q length = chunk length, k length = everything whose KV is valid
+            # after this pass (cached prefix + previous chunks + this chunk);
+            # under chunked prefill they differ, which is the signature of a
+            # chunked pass
+            seqlens_q.append(end - start)
+            seqlens_k.append(end)
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlens_q[-1])
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlens_k[-1])
             if seq.block_table:
-                for i, block_id in enumerate(seq.block_table[seq.num_cached_blocks:]):
-                    if seq.num_cached_blocks + i != seq.num_blocks - 1:
-                        slot_mappings.extend(list(range(block_id * self.block_size, (block_id+1) * self.block_size)))
-                    else:
-                        slot_mappings.extend(list(range(block_id * self.block_size, block_id * self.block_size + seq.last_block_num_tokens)))
+                # one slot per new token; a chunk may start and end mid-block,
+                # so resolve each token's slot independently
+                for t in range(start, end):
+                    slot_mappings.append(seq.block_table[t // self.block_size] * self.block_size + t % self.block_size)
         if cu_seqlens_q[-1] < cu_seqlens_k[-1]:
             # pad block_tables
             all_block_tables = [seq.block_table for seq in seqs]
@@ -319,6 +334,7 @@ class ModelRunner:
             slot_mapping=slot_mapping_tensor,
             context_lens=None,
             block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
+            positions=torch.tensor(positions, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
         )
         return input_ids
 
@@ -339,6 +355,7 @@ class ModelRunner:
             block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
             block_tables.append(block_table)
         input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        context_lens_tensor = torch.tensor(context_lens, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
         set_context(
             is_prefill=False,
             cu_seqlens_q=None,
@@ -346,10 +363,12 @@ class ModelRunner:
             max_seqlen_q=0,
             max_seqlen_k=0,
             slot_mapping=torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
-            context_lens=torch.tensor(context_lens, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
+            context_lens=context_lens_tensor,
             block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
+            # decode position of each sequence: its latest token
+            positions=context_lens_tensor - 1,
         )
-        return input_ids    
+        return input_ids
 
     # prepare the temperature
     def prepare_sample(self, seqs: list[Sequence]) -> None:
@@ -401,7 +420,25 @@ class ModelRunner:
         # only sample when rank == 0
         token_ids = None
         if self.rank == 0:
-            token_ids = self.sampler(logits, self.prepare_sample(seqs))
+            if is_prefill:
+                # only sequences whose chunk completes the prompt are sampled:
+                # their last chunk token is the last prompt token, so the
+                # sampled token is the first completion token. Intermediate
+                # chunks emit no token and get a -1 sentinel instead.
+                final_indices = [
+                    i for i, seq in enumerate(seqs)
+                    if seq.num_prefill_chunk_tokens == 0
+                    or seq.num_computed_tokens + seq.num_prefill_chunk_tokens >= seq.num_prompt_tokens
+                ]
+                token_ids = torch.full((len(seqs),), -1, dtype=torch.long, device=f'cuda:{self.rank}')
+                if final_indices:
+                    sampled = self.sampler(
+                        logits[final_indices],
+                        self.prepare_sample([seqs[i] for i in final_indices]),
+                    )
+                    token_ids[final_indices] = sampled
+            else:
+                token_ids = self.sampler(logits, self.prepare_sample(seqs))
         reset_context()
         return token_ids
 

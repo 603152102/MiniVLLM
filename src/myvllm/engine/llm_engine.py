@@ -4,9 +4,10 @@ import time
 import torch.multiprocessing as mp
 from typing import Any
 
-from myvllm.engine.sequence import Sequence
-from myvllm.engine.scheduler import Scheduler
 from myvllm.engine.model_runner import ModelRunner
+from myvllm.engine.scheduler import Scheduler
+from myvllm.engine.scheduler_chunked import ChunkedScheduler
+from myvllm.engine.sequence import Sequence
 from myvllm.sampling_parameters import SamplingParams
 from transformers import AutoTokenizer
 
@@ -45,7 +46,12 @@ class LLMEngine:
         # collective barrier — rank-0 blocks until all worker ranks have joined.
         # The scheduler should only be created after that rendezvous completes.
         # When world_size == 1 there is no barrier and no real dependency.
-        self.scheduler = Scheduler(
+        # NOTE: enable_chunked_prefill is only safe to flip once the model
+        # runner chunks its prefill input and the paged prefill kernel lands
+        # (see 实现chunked_prefill.md steps 3-5); the scheduler alone is not
+        # enough for numerically correct output.
+        scheduler_cls = ChunkedScheduler if config.get("enable_chunked_prefill", False) else Scheduler
+        self.scheduler = scheduler_cls(
             max_num_sequences=config.get("max_num_sequences", 16),
             max_num_batched_tokens=config.get("max_num_batched_tokens", 1024),
             max_cached_blocks=config.get("max_cached_blocks", 1024),
@@ -81,6 +87,9 @@ class LLMEngine:
         self.scheduler.postprocess(scheduled_sequences, outputs)
 
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in scheduled_sequences if seq.is_finished]
+        # NOTE: under chunked prefill this counts whole prompts per chunk step
+        # (overcounting the tokens actually processed); it only feeds the
+        # throughput print in generate(), fix alongside the runner changes.
         num_processed_tokens = sum(len(seq) for seq in scheduled_sequences) if is_prefill else len(scheduled_sequences)
 
         return outputs, num_processed_tokens, is_prefill
