@@ -11,6 +11,11 @@ class SequenceStatus(Enum):
     FINISHED = auto()
 
 
+class SequenceStage(Enum):
+    PREFILL = auto()
+    DECODE = auto()
+
+
 class Sequence:
     counter = count()
 
@@ -36,12 +41,34 @@ class Sequence:
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
         self.max_model_length = sampling_params.max_model_length
+        self.num_computed_tokens = 0  #chunked_prefill计算过的token数
+        # computation phase: PREFILL while the prompt is still being computed
+        # in chunks (no tokens generated), DECODE once generation starts
+        self.stage = SequenceStage.PREFILL
+        # number of prompt tokens scheduled for prefill in the current step,
+        # valid only between schedule() and postprocess() of that step
+        self.num_prefill_chunk_tokens = 0
 
     def __len__(self):
         return self.num_tokens
 
     def __getitem__(self, idx):
         return self.token_ids[idx]
+    
+    @property
+    def is_prefill(self):
+        return self.num_computed_tokens < self.num_prompt_tokens
+
+    @property
+    def is_prefill_done(self):
+        return self.num_computed_tokens >= self.num_prompt_tokens
+
+    @property
+    def num_uncomputed_prompt_tokens(self):
+        return max(
+            self.num_prompt_tokens - self.num_computed_tokens,
+            0,
+        )
 
     @property
     def is_finished(self):
@@ -87,9 +114,12 @@ class Sequence:
 
     def __getstate__(self):
         return (
-            self.num_tokens, 
-            self.num_prompt_tokens, 
-            self.num_cached_tokens, 
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.num_computed_tokens,
+            self.stage,
+            self.num_prefill_chunk_tokens,
             self.block_table,
             self.token_ids if self.num_completion_tokens == 0 else self.last_token
         )
@@ -99,6 +129,9 @@ class Sequence:
             self.num_tokens,
             self.num_prompt_tokens,
             self.num_cached_tokens,
+            self.num_computed_tokens,
+            self.stage,
+            self.num_prefill_chunk_tokens,
             self.block_table,
             last_token_or_ids
         ) = state
