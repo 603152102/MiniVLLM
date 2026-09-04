@@ -2,6 +2,7 @@ import atexit
 import torch.distributed as dist
 import time
 import torch.multiprocessing as mp
+from typing import Any
 
 from myvllm.engine.sequence import Sequence
 from myvllm.engine.scheduler import Scheduler
@@ -93,7 +94,7 @@ class LLMEngine:
     # add_prompt for each prompt
     # call step until all sequences are finished
     # return the generated texts
-    def generate(self, prompts: list[str], sampling_params: SamplingParams) -> list[str]:
+    def generate(self, prompts: list[str], sampling_params: SamplingParams) -> dict[str, Any]:
         for prompt in prompts:
             self.add_prompt(prompt, sampling_params)
         generated_tokens = {}
