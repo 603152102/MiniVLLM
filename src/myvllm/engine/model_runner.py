@@ -81,6 +81,17 @@ class ModelRunner:
 
         self.sampler = SamplerLayer()
 
+        # speculative decoding: the draft runner shares this model's weights
+        # and KV pool (see spec_decode/draft_runner.py); None when spec is off
+        self.draft_runner = None
+        if config.get('enable_speculative', False):
+            from myvllm.spec_decode.draft_runner import DraftRunner
+            self.draft_runner = DraftRunner(
+                self.model,
+                self.sampler,
+                skip_layers=config.get('draft_skip_layers', False),
+            )
+
         # Store default dtype before it's needed in allocate_kv_cache
         self.default_dtype = torch.get_default_dtype()
 
@@ -242,6 +253,17 @@ class ModelRunner:
                 seq.num_computed_tokens = seq_len - half
                 seq.num_prefill_chunk_tokens = half
                 self.run([seq], is_prefill=True)
+                # speculative verify path: per-sequence (k+1)-token chunk
+                # following a computed prefix (same paged prefill kernel, same
+                # cu_seqlens_q < cu_seqlens_k signature -- 审阅 #12: free
+                # warmup, the kernel is already compiled for this block count)
+                if self.draft_runner is not None:
+                    k = self.config.get('num_spec_tokens', 4)
+                    spec_seq_len = max(seq_len - k, k + 1)
+                    vseq = Sequence(token_ids=[0] * spec_seq_len, block_size=block_size)
+                    vseq.block_table = list(range(num_blocks))
+                    vseq.spec_token_ids = [0] * k
+                    self.run_verify([vseq], k)
         finally:
             self.enforce_eager = enforce_eager
         torch.cuda.empty_cache()
@@ -502,6 +524,132 @@ class ModelRunner:
                 token_ids = self.sampler(logits, self.prepare_sample(seqs))
         reset_context()
         return token_ids
+
+    # ------------------------------------------------------------------
+    # speculative decoding: draft propose steps + verify forward
+    # ------------------------------------------------------------------
+
+    # One draft decoding step (step i of k). Input = the token the draft
+    # produced last (step 0: the sequence's last accepted token x), one
+    # paged-decode forward whose KV for the input position t+i-1 lands in the
+    # shared target cache, then a temperature-scaled sample for position t+i.
+    # Step 0 DOES store position t-1: the last accepted token (the previous
+    # round's bonus/replacement) has no KV yet -- nothing ever computed it --
+    # and without this store the draft's first step attends a garbage slot,
+    # making q_0 systematically wrong and the round always reject at level 0.
+    # The verify pass re-stores slot t-1 with the target's own KV before its
+    # attention reads it, so the target never sees the draft's value (correct
+    # even under draft_skip_layers, where the two differ).
+    # The RNG is reseeded per (round, step) so every rank draws the same draft
+    # tokens (TP workers mirror this method through the shm loop and their
+    # tokens feed the next step's input, so they must agree with rank 0).
+    # Returns (scaled_logits [B, V], tokens [B]) where scaled_logits are the
+    # logits divided by each sequence's temperature -- the exact distribution
+    # acceptance.py compares against the target's (审阅 #1: one scaling path).
+    def propose_step(self, seqs: list[Sequence], i: int, k: int, round_id: int):
+        assert self.draft_runner is not None, "speculative decoding is not enabled"
+        torch.manual_seed(round_id * 10007 + i)  # deterministic across ranks
+        block_size = self.block_size
+        input_ids = []
+        context_lens = []
+        slot_mappings = []
+        for seq in seqs:
+            t = len(seq)
+            if i == 0:
+                assert not seq.spec_token_ids, "draft buffer must be empty at step 0"
+                input_ids.append(seq.last_token)
+            else:
+                input_ids.append(seq.spec_token_ids[i - 1])
+            # KV of the input position t+i-1 lands in its canonical slot
+            p = t + i - 1
+            slot_mappings.append(seq.block_table[p // block_size] * block_size + p % block_size)
+            context_lens.append(t + i)
+        all_block_tables = [seq.block_table for seq in seqs]
+        max_num_blocks = max(len(bt) for bt in all_block_tables)
+        block_tables = [bt + [-1] * (max_num_blocks - len(bt)) for bt in all_block_tables]
+        input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        context_lens_tensor = torch.tensor(context_lens, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        set_context(
+            is_prefill=False,
+            cu_seqlens_q=None,
+            cu_seqlens_k=None,
+            max_seqlen_q=0,
+            max_seqlen_k=0,
+            slot_mapping=torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
+            context_lens=context_lens_tensor,
+            block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            positions=context_lens_tensor - 1,
+        )
+        with torch.inference_mode():
+            hidden_states = self.draft_runner.forward(input_ids)
+            logits = self.model.compute_logits(hidden_states)
+        temperatures = self.prepare_sample(seqs)
+        scaled_logits = logits / temperatures.unsqueeze(-1)
+        tokens = self.sampler(logits, temperatures)
+        reset_context()
+        return scaled_logits, tokens
+
+    # Prepare the verify forward: per sequence q = k+1 tokens -- the last
+    # accepted token x (position t-1, whose KV is recomputed idempotently) and
+    # the k draft tokens (positions t..t+k-1). The batch is chunk-shaped
+    # (cu_seqlens_q < cu_seqlens_k), so the existing paged prefill kernel runs:
+    # the chunk's KV occupies the tail of the KV range, which is exactly the
+    # verify layout. Slots are resolved per token, cross-block safe.
+    def prepare_verify(self, seqs: list[Sequence], k: int) -> torch.Tensor:
+        block_size = self.block_size
+        input_ids = []
+        positions = []
+        slot_mappings = []
+        seqlens_q = []
+        seqlens_k = []
+        cu_seqlens_q = [0]
+        cu_seqlens_k = [0]
+        for seq in seqs:
+            t = len(seq)
+            assert len(seq.spec_token_ids) == k, (
+                f"expected {k} draft tokens, got {len(seq.spec_token_ids)}"
+            )
+            input_ids.extend([seq.last_token] + list(seq.spec_token_ids))
+            positions.extend(range(t - 1, t + k))
+            seqlens_q.append(k + 1)
+            seqlens_k.append(t + k)
+            cu_seqlens_q.append(cu_seqlens_q[-1] + k + 1)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + t + k)
+            for p in range(t - 1, t + k):
+                slot_mappings.append(seq.block_table[p // block_size] * block_size + p % block_size)
+        all_block_tables = [seq.block_table for seq in seqs]
+        max_num_blocks = max(len(bt) for bt in all_block_tables)
+        block_tables = [bt + [-1] * (max_num_blocks - len(bt)) for bt in all_block_tables]
+        input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        set_context(
+            is_prefill=True,
+            cu_seqlens_q=torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            cu_seqlens_k=torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            max_seqlen_q=k + 1,
+            max_seqlen_k=max(seqlens_k),
+            slot_mapping=torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
+            context_lens=None,
+            block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            positions=torch.tensor(positions, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
+        )
+        return input_ids
+
+    # One verify forward: the target model over [x] + k drafts per sequence.
+    # Returns target_logits [B, k+1, V] scaled by each sequence's temperature:
+    # rows 0..k-1 are the distributions that verify draft tokens 0..k-1, row k
+    # is the bonus distribution (the position after the last draft token).
+    def run_verify(self, seqs: list[Sequence], k: int) -> torch.Tensor:
+        input_ids = self.prepare_verify(seqs, k)
+        with torch.inference_mode():
+            hidden_states = self.model(input_ids)
+            # slice_last=False: keep every row (the prefill convention would
+            # keep only the bonus row, but acceptance needs all k+1)
+            logits = self.model.compute_logits(hidden_states, slice_last=False)
+        B = len(seqs)
+        logits = logits.view(B, k + 1, -1)
+        temperatures = self.prepare_sample(seqs)
+        reset_context()
+        return logits / temperatures.view(B, 1, 1)
 
     # capture the CUDA graph:
     # pre-allocation at maximum sizes: allocated onece and reuse for all graphs

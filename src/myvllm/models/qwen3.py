@@ -342,8 +342,11 @@ class Qwen3ForCausalLM(nn.Module):
         x = self.model(input_ids)
         return x 
 
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        logits = self.lm_head(hidden_states)
+    def compute_logits(self, hidden_states: torch.Tensor, slice_last: bool | None = None) -> torch.Tensor:
+        # slice_last=None: prefill convention (only the last token of each
+        # sequence is sampled); the speculative verify pass passes False to
+        # keep all k+1 rows per sequence
+        logits = self.lm_head(hidden_states, slice_last=slice_last)
         return logits
 
 if __name__ == "__main__":

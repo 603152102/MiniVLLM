@@ -67,9 +67,14 @@ class ParallelLMHead(VocabParallelEmbedding):
 
     # x: [batch_size, seq_len, hidden_size]
     # weight: [vocab_size_per_partition, hidden_size]
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    # slice_last: None follows the context (prefill batches only sample the last
+    # token of each sequence, so everything else is skipped); the speculative
+    # verify pass needs every row and passes slice_last=False explicitly.
+    def forward(self, x: torch.Tensor, slice_last: bool | None = None) -> torch.Tensor:
         context = get_context()
-        if context.is_prefill:
+        if slice_last is None:
+            slice_last = context.is_prefill
+        if slice_last:
             # cu_seqlens_q = [0, 5, 8, 12]
             # last_indices = [5, 8, 12] - 1 = [4, 7, 11]
             last_token = context.cu_seqlens_q[1:] - 1  # exclude the first element which is 0

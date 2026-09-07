@@ -159,6 +159,16 @@ class BlockManager:
             assert last_block_for_seq_id in self.used_block_ids, "Last block should be allocated"
             assert self.blocks[last_block_for_seq_id].hash == -1, "Last block should be partial block with hash -1"
 
+    # Reserve one more block for a sequence without committing any token.
+    # Speculative decoding pre-allocates the physical blocks of the k
+    # provisional spec slots before the draft model writes KV into them
+    # (the design's "逐 token append" reduced to pure allocation: the spec
+    # tokens never enter token_ids, so append()'s finalize/hash bookkeeping
+    # has nothing to see here; rollback() reconciles content afterwards).
+    def preallocate(self, seq: Sequence) -> None:
+        block = self._allocate_block(self.free_block_ids[0])
+        seq.block_table.append(block.block_id)
+
     # Number of blocks a sequence owns at a decode-step rest boundary for a given
     # token count L. The engine allocates a block lazily: the block covering a
     # token that is the first of a new block is only allocated when the *next*
@@ -203,38 +213,38 @@ class BlockManager:
         seq.num_cached_tokens = 0
         if L == 0:
             return
-        # reconcile the trailing block against the accepted content
-        last = self.blocks[seq.block_table[-1]]
-        if L % self.block_size == 0:
-            # accepted prefix ends on a block boundary: the trailing block is full
-            # and must carry exactly the accepted slice so future prefix-cache
-            # matching (and append()'s "previous block finalized" assert) see the
-            # real content, not a slice that included rolled-back tokens
-            nb = L // self.block_size
-            full_tokens = seq.token_ids[(nb - 1) * self.block_size : L]
-            h = self.compute_hash(
-                full_tokens,
-                prefix_hash_value=(
-                    -1
-                    if len(seq.block_table) == 1
-                    else self.blocks[seq.block_table[-2]].hash
-                ),
-            )
-            if last.hash != h or last.token_ids != full_tokens:
-                if last.hash in self.hash_to_block_id and self.hash_to_block_id[last.hash] == last.block_id:
-                    del self.hash_to_block_id[last.hash]
-                last.update(h, full_tokens)
-                self.hash_to_block_id[h] = last.block_id
-        else:
-            # accepted prefix ends mid-block: the trailing block is partial and
-            # must not look finalized (a rolled-back token may have completed it).
-            # If a rolled-back token had completed it (finalized during the
-            # provisional run) its stored content/hash now includes rolled-back
-            # tokens; reset both so it looks like a never-finalized partial block
-            # again (the engine's decode path never fills block.token_ids for a
-            # partial block).
-            if last.hash != -1:
-                if self.hash_to_block_id.get(last.hash) == last.block_id:
-                    del self.hash_to_block_id[last.hash]
-                last.hash = -1
-                last.token_ids = []
+        # Reconcile every kept block against the accepted content. A provisional
+        # run may have completed a block (leaving it finalized with content that
+        # includes rolled-back tokens) or, in the spec path, filled a block
+        # without finalizing it at all (blocks are pre-allocated, hashes only
+        # land here). After this loop a full block always carries exactly its
+        # accepted slice, and a partial block always looks never-finalized
+        # (hash -1, no content) -- so prefix-cache matching and append()'s
+        # "previous block finalized" assert see the real state.
+        for i, block_id in enumerate(seq.block_table):
+            block = self.blocks[block_id]
+            start = i * self.block_size
+            if (i + 1) * self.block_size <= L:
+                # full block: finalize with exactly the accepted slice
+                full_tokens = seq.token_ids[start : start + self.block_size]
+                h = self.compute_hash(
+                    full_tokens,
+                    prefix_hash_value=(
+                        -1
+                        if i == 0
+                        else self.blocks[seq.block_table[i - 1]].hash
+                    ),
+                )
+                if block.hash != h or block.token_ids != full_tokens:
+                    if block.hash in self.hash_to_block_id and self.hash_to_block_id[block.hash] == block_id:
+                        del self.hash_to_block_id[block.hash]
+                    block.update(h, full_tokens)
+                    self.hash_to_block_id[h] = block_id
+            elif block.hash != -1:
+                # partial block that a rolled-back token had completed: reset it
+                # to the never-finalized state (the decode path never fills
+                # block.token_ids for a partial block)
+                if self.hash_to_block_id.get(block.hash) == block_id:
+                    del self.hash_to_block_id[block.hash]
+                block.hash = -1
+                block.token_ids = []
