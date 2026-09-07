@@ -14,6 +14,7 @@ def make_scheduler(
     max_num_sequences=10,
     max_cached_blocks=100,
     block_size=4,
+    pd_mixed=True,
 ):
     return ChunkedScheduler(
         max_num_sequences=max_num_sequences,
@@ -21,6 +22,7 @@ def make_scheduler(
         max_cached_blocks=max_cached_blocks,
         block_size=block_size,
         eos=0,
+        pd_mixed=pd_mixed,
     )
 
 
@@ -258,13 +260,14 @@ class TestPreemptResetsChunkState:
         scheduler.block_manager = mock_bm
 
         scheduled, is_prefill = scheduler.schedule()
-        assert not is_prefill
-        assert scheduled == []
-        assert seq in scheduler.waiting
+        # preemption resets the chunk state, and the freed sequence is
+        # rescheduled as a prefill chunk in the same call (no wasted step)
+        assert is_prefill
+        assert scheduled == [seq]
         assert seq.status == SequenceStatus.WAITING
         assert seq.stage == SequenceStage.PREFILL
         assert seq.num_computed_tokens == 0
-        assert seq.num_prefill_chunk_tokens == 0
+        assert seq.num_prefill_chunk_tokens == 3
         mock_bm.deallocate.assert_called_once_with(seq)
 
     def test_preempted_seq_reprefills_from_scratch(self):
@@ -275,18 +278,20 @@ class TestPreemptResetsChunkState:
         mock_bm = MagicMock()
         mock_bm.can_append.return_value = False
         mock_bm.deallocate.return_value = None
-        scheduler.block_manager = mock_bm
-        scheduler.schedule()
-
-        mock_bm.reset_mock()
         mock_bm.can_allocate.return_value = True
         mock_bm.allocate.return_value = None
+        scheduler.block_manager = mock_bm
 
         scheduled, is_prefill = scheduler.schedule()
+        # the preempted sequence's prompt is rescheduled for prefill in the
+        # same call, allocating blocks again from scratch
         assert is_prefill
         assert scheduled == [seq]
+        mock_bm.deallocate.assert_called_once_with(seq)
         mock_bm.can_allocate.assert_called_once_with(seq)
         assert seq.num_prefill_chunk_tokens == 3
+        assert seq.stage == SequenceStage.PREFILL
+        assert seq.num_computed_tokens == 0
 
 
 class TestBug2ChunkBudget:
@@ -319,8 +324,9 @@ class TestBug2ChunkBudget:
 class TestBug1CanAppendFailure:
     """
     Setup: 2 sequences in running, can_append returns False for the first.
-    Expected: seq_a keeps its place, seq_b (the preempted one) lands in
-    waiting with its prefill state reset. Neither may disappear.
+    Expected: seq_a keeps its place and decodes; seq_b (the preempted one)
+    is immediately rescheduled as a prefill chunk in the same step, with
+    its prefill state reset. Neither may disappear.
     """
 
     def test_seqs_not_lost(self):
@@ -337,16 +343,20 @@ class TestBug1CanAppendFailure:
         scheduler.block_manager = mock_bm
 
         scheduled, is_prefill = scheduler.schedule()
-        assert not is_prefill
+        # the batch contains the rescheduled prefill chunk of seq_b
+        assert is_prefill
 
         tracked = all_tracked(scheduler, scheduled)
         assert seq_a in tracked, "Bug 1: seq_a disappeared"
         assert seq_b in tracked, "Bug 1: seq_b disappeared"
 
-        assert seq_b in scheduler.waiting
+        # the preempted seq_b is rescheduled as a prefill chunk in the same
+        # step: parked in running for this step, not left in waiting
+        assert seq_b not in scheduler.waiting
         assert seq_b.status == SequenceStatus.WAITING
         assert seq_b.stage == SequenceStage.PREFILL
         assert seq_b.num_computed_tokens == 0
+        assert seq_b.num_prefill_chunk_tokens == 3  # whole 3-token prompt re-prefilled
 
 
 class TestDecodeOrderPreservation:
@@ -396,6 +406,148 @@ class TestOversizeRejection:
             scheduler.add_sequence(seq)
 
 
+class TestMixedPrefillDecode:
+    """
+    P/D mixed scheduling: decode sequences and prefill chunks share one
+    batch. Decode is scheduled first so its latency is never starved, then
+    the remaining token budget is filled with chunks from waiting.
+    """
+
+    def _mixed_setup(self, budget, prompt_len=6):
+        scheduler = make_scheduler(max_num_batched_tokens=budget)
+        # decode sequence in running
+        seq_d = Sequence([1, 2, 3], block_size=4)
+        inject_running(scheduler, seq_d)
+        # waiting sequence with a chunkable prompt
+        seq_p = Sequence(list(range(10, 10 + prompt_len)), block_size=4)
+        scheduler.add_sequence(seq_p)
+
+        mock_bm = MagicMock()
+        mock_bm.can_append.return_value = True
+        mock_bm.append.return_value = None
+        mock_bm.can_allocate.return_value = True
+        mock_bm.allocate.return_value = None
+        scheduler.block_manager = mock_bm
+        return scheduler, seq_d, seq_p
+
+    def test_decode_and_chunk_share_one_batch(self):
+        scheduler, seq_d, seq_p = self._mixed_setup(budget=8)
+        scheduled, is_prefill = scheduler.schedule()
+
+        assert is_prefill
+        # decode comes first, the chunk fills the remaining budget
+        assert scheduled == [seq_d, seq_p]
+        assert seq_p.num_prefill_chunk_tokens == 6  # min(prompt 6, budget left 7)
+
+    def test_decode_scheduled_before_chunks(self):
+        scheduler, seq_d, seq_p = self._mixed_setup(budget=3)
+        scheduled, is_prefill = scheduler.schedule()
+
+        assert scheduled == [seq_d, seq_p]
+        assert seq_p.num_prefill_chunk_tokens == 2  # 3 budget - 1 decode token
+
+    def test_pure_decode_when_budget_exhausted(self):
+        scheduler, seq_d, seq_p = self._mixed_setup(budget=1)
+        scheduled, is_prefill = scheduler.schedule()
+
+        assert scheduled == [seq_d]
+        assert not is_prefill  # no chunk in the batch -> pure decode
+        assert seq_p in scheduler.waiting
+        assert seq_p.num_prefill_chunk_tokens == 0
+
+    def test_mixed_postprocess(self):
+        # batch = decode seq + final-chunk seq + partial-chunk seq
+        scheduler = make_scheduler(max_num_batched_tokens=10)
+        seq_d = Sequence([1, 2, 3], block_size=4)
+        inject_running(scheduler, seq_d)
+        seq_final = Sequence([1, 2, 3], block_size=4)   # prompt 3 -> one final chunk
+        seq_partial = Sequence([1] * 8, block_size=4)   # prompt 8 -> 6-token chunk, partial
+        scheduler.add_sequence(seq_final)
+        scheduler.add_sequence(seq_partial)
+
+        mock_bm = MagicMock()
+        mock_bm.can_append.return_value = True
+        mock_bm.append.return_value = None
+        mock_bm.can_allocate.return_value = True
+        mock_bm.allocate.return_value = None
+        scheduler.block_manager = mock_bm
+
+        scheduled, is_prefill = scheduler.schedule()
+        assert scheduled == [seq_d, seq_final, seq_partial]
+        assert seq_final.num_prefill_chunk_tokens == 3
+        assert seq_partial.num_prefill_chunk_tokens == 6  # 10 - 1 - 3
+
+        scheduler.postprocess(scheduled, [7, 8, 99])
+        # decode seq appended its token and stays running
+        assert seq_d.num_completion_tokens == 1
+        assert seq_d in scheduler.running
+        # final chunk transitions to decode and appends the sampled token
+        assert seq_final.stage == SequenceStage.DECODE
+        assert seq_final.num_completion_tokens == 1
+        assert seq_final in scheduler.running
+        # partial chunk: no token, cursor advanced, back to waiting
+        assert seq_partial.stage == SequenceStage.PREFILL
+        assert seq_partial.num_completion_tokens == 0
+        assert seq_partial.num_computed_tokens == 6
+        assert seq_partial in scheduler.waiting
+        assert seq_partial not in scheduler.running
+
+    def test_preempt_then_chunk_in_same_batch(self):
+        scheduler = make_scheduler(max_num_batched_tokens=8)
+        seq_d = Sequence([1, 2, 3], block_size=4)
+        inject_running(scheduler, seq_d)
+        seq_p = Sequence([1] * 6, block_size=4)
+        scheduler.add_sequence(seq_p)
+
+        mock_bm = MagicMock()
+        mock_bm.can_append.side_effect = [False, True, True]
+        mock_bm.append.return_value = None
+        mock_bm.deallocate.return_value = None
+        mock_bm.can_allocate.return_value = True
+        mock_bm.allocate.return_value = None
+        scheduler.block_manager = mock_bm
+
+        scheduled, is_prefill = scheduler.schedule()
+        # the decode seq was preempted and its prompt rescheduled as a chunk
+        # in the same call, sharing the budget with the waiting prompt
+        assert is_prefill
+        assert scheduled == [seq_d, seq_p]
+        assert seq_d.stage == SequenceStage.PREFILL
+        assert seq_d.num_computed_tokens == 0
+        assert seq_d.num_prefill_chunk_tokens == 3   # its own prompt recompute
+        assert seq_p.num_prefill_chunk_tokens == 5   # 8 budget - 3
+
+    def test_decode_order_preserved_after_mixed(self):
+        scheduler = make_scheduler(max_num_batched_tokens=8)
+        seq_a = Sequence([1], block_size=4)
+        seq_b = Sequence([2], block_size=4)
+        inject_running(scheduler, seq_a, seq_b)
+        seq_p = Sequence([3] * 4, block_size=4)
+        scheduler.add_sequence(seq_p)
+
+        mock_bm = MagicMock()
+        mock_bm.can_append.return_value = True
+        mock_bm.append.return_value = None
+        mock_bm.can_allocate.return_value = True
+        mock_bm.allocate.return_value = None
+        scheduler.block_manager = mock_bm
+
+        scheduled, is_prefill = scheduler.schedule()
+        assert scheduled[:2] == [seq_a, seq_b]
+        assert is_prefill
+        # decode seqs are re-added to running in their original order, the
+        # parked chunk sits behind them
+        assert list(scheduler.running)[:2] == [seq_a, seq_b]
+
+    def test_no_sequence_lost(self):
+        scheduler, seq_d, seq_p = self._mixed_setup(budget=3)
+        scheduled, _ = scheduler.schedule()
+
+        tracked = all_tracked(scheduler, scheduled)
+        assert seq_d in tracked
+        assert seq_p in tracked
+
+
 class TestPickleRoundtrip:
     """
     Sequences cross process boundaries via pickle when world_size > 1: the
@@ -431,3 +583,74 @@ class TestPickleRoundtrip:
         # decode: only the last token is shipped and reconstructed
         assert restored.token_ids == [42]
         assert restored.last_token == 42
+
+
+class TestPureModeNoMixing:
+    """
+    enable_pd_mixed=False: batches are pure. Prefill chunks are scheduled
+    first, and whenever any chunk is scheduled the decode queue waits for
+    the next step — the legacy pre-P/D-mixed behavior.
+    """
+
+    def _pure_setup(self, budget, prompt_len=6):
+        scheduler = make_scheduler(max_num_batched_tokens=budget, pd_mixed=False)
+        # decode sequence in running
+        seq_d = Sequence([1, 2, 3], block_size=4)
+        inject_running(scheduler, seq_d)
+        # waiting sequence with a chunkable prompt
+        seq_p = Sequence(list(range(10, 10 + prompt_len)), block_size=4)
+
+        mock_bm = MagicMock()
+        mock_bm.can_append.return_value = True
+        mock_bm.append.return_value = None
+        mock_bm.can_allocate.return_value = True
+        mock_bm.allocate.return_value = None
+        mock_bm.blocks = [None] * 100  # add_sequence capacity check
+        scheduler.block_manager = mock_bm
+        scheduler.add_sequence(seq_p)
+        return scheduler, seq_d, seq_p
+
+    def test_chunk_scheduled_alone_decode_waits(self):
+        scheduler, seq_d, seq_p = self._pure_setup(budget=8)
+        scheduled, is_prefill = scheduler.schedule()
+
+        # the chunk is scheduled alone; the decode sequence is never mixed in
+        assert scheduled == [seq_p]
+        assert is_prefill
+        assert seq_p.num_prefill_chunk_tokens == 6  # whole 6-token prompt
+        assert seq_d not in scheduled
+        assert seq_d in scheduler.running  # untouched, still queued for decode
+
+    def test_decode_runs_when_no_chunk(self):
+        scheduler, seq_d, seq_p = self._pure_setup(budget=8)
+        # finish the only waiting prompt first
+        scheduled, _ = scheduler.schedule()
+        scheduler.postprocess(scheduled, [99])
+
+        scheduled, is_prefill = scheduler.schedule()
+        assert scheduled == [seq_d, seq_p]
+        assert not is_prefill
+        assert seq_d in scheduler.running
+        assert seq_p in scheduler.running  # both re-added in order
+
+    def test_preempted_seq_waits_for_next_step(self):
+        scheduler = make_scheduler(pd_mixed=False)
+        seq_a = Sequence([1, 2, 3], block_size=4)
+        seq_b = Sequence([4, 5, 6], block_size=4)
+        inject_running(scheduler, seq_a, seq_b)
+
+        mock_bm = MagicMock()
+        mock_bm.can_append.side_effect = [False, True]
+        mock_bm.append.return_value = None
+        mock_bm.deallocate.return_value = None
+        scheduler.block_manager = mock_bm
+
+        scheduled, is_prefill = scheduler.schedule()
+        # unlike pd_mixed mode, the preempted seq is NOT re-chunked in the
+        # same step: it stays in waiting until the next schedule() call
+        assert scheduled == [seq_a]
+        assert not is_prefill
+        assert seq_b in scheduler.waiting
+        assert seq_b.stage == SequenceStage.PREFILL
+        assert seq_b.num_computed_tokens == 0
+        assert seq_b.num_prefill_chunk_tokens == 0
