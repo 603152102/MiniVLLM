@@ -4,11 +4,16 @@ from myvllm.engine.sequence import Sequence, SequenceStage, SequenceStatus
 
 
 class ChunkedScheduler:
-    def __init__(self, max_num_sequences: int, max_num_batched_tokens: int, max_cached_blocks: int, block_size: int, eos: int):
+    def __init__(self, max_num_sequences: int, max_num_batched_tokens: int, max_cached_blocks: int, block_size: int, eos: int, pd_mixed: bool = True):
         # block manager
         self.block_manager = BlockManager(max_cached_blocks, block_size)
         self.max_num_batched_tokens = max_num_batched_tokens
         self.max_num_sequences = max_num_sequences
+        # P/D mixed scheduling: when True, decode sequences and prefill chunks
+        # share one batch (decode first, chunks fill the remaining budget).
+        # When False, batches are pure: chunks first, and if any chunk was
+        # scheduled the decode queue waits for the next step.
+        self.pd_mixed = pd_mixed
         # sequence queue
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
@@ -39,37 +44,55 @@ class ChunkedScheduler:
         # An empty schedule is only legitimate when this call freed blocks by
         # preempting, so the next call can make progress. See the guard below.
         preempted = False
-        # try schedule for chunked prefilling from waiting queue if not exceeding limits
-        # a prompt too large for one batch is prefilled in chunks: each chunk
-        # computes only its own tokens, and the sequence stays in WAITING (no
-        # token is generated) until the whole prompt has been computed
-        while self.waiting and len(scheduled_sequences) < self.max_num_sequences:
-            seq = self.waiting[0]
-            # allocate all blocks up front on the first chunk (MVP simplification),
-            # later chunks only compute the remaining prompt tokens
-            if seq.num_computed_tokens == 0 and not self.block_manager.can_allocate(seq):
-                break
-            chunk_len = min(seq.num_uncomputed_prompt_tokens, self.max_num_batched_tokens - current_scheduled_tokens)
-            if chunk_len <= 0:
-                break
-            seq = self.waiting.popleft() # remove from waiting
-            if seq.num_computed_tokens == 0:
-                self.block_manager.allocate(seq)
-            # stamp the chunk size for this step: the model runner reads it to
-            # slice the chunk, postprocess() reads it to advance the cursor
-            seq.num_prefill_chunk_tokens = chunk_len
-            # INVARIANT: a scheduled prefill chunk is parked in `running` only
-            # for the duration of this step; postprocess() re-homes it before
-            # the next schedule() call, so the decode loop below never pops a
-            # PREFILL-stage sequence
-            self.running.append(seq)
-            scheduled_sequences.append(seq)
-            current_scheduled_tokens += chunk_len
-        if scheduled_sequences:
-            return scheduled_sequences, True
 
-        # try schedule for completion from running queue
-        while self.running:
+        if self.pd_mixed:
+            # P/D mixed scheduling (the essence of chunked prefill): decode
+            # sequences are scheduled first so their latency is never starved,
+            # then the remaining token budget is filled with prefill chunks
+            # from the waiting queue. Both kinds share one batch and one
+            # forward pass.
+            preempted, current_scheduled_tokens = self._schedule_decode(
+                scheduled_sequences, current_scheduled_tokens)
+            current_scheduled_tokens = self._schedule_chunks(
+                scheduled_sequences, current_scheduled_tokens)
+        else:
+            # Pure scheduling (legacy behavior): prefill chunks first. If any
+            # chunk was scheduled, the decode queue waits for the next step —
+            # batches are never mixed.
+            current_scheduled_tokens = self._schedule_chunks(
+                scheduled_sequences, current_scheduled_tokens)
+            if scheduled_sequences:
+                return scheduled_sequences, True
+            preempted, current_scheduled_tokens = self._schedule_decode(
+                scheduled_sequences, current_scheduled_tokens)
+
+        # re-add the decode sequences to running in the same order (prefill
+        # chunk sequences were parked in running above and stay there for
+        # postprocess() to re-home)
+        decode_seqs = [s for s in scheduled_sequences if s.stage == SequenceStage.DECODE]
+        if decode_seqs:
+            self.running.extendleft(reversed(decode_seqs))
+        elif not scheduled_sequences and not preempted and (self.waiting or self.running):
+            # Nothing was scheduled and nothing was preempted, so no engine state
+            # changed: every later schedule() would take the same decisions and
+            # LLMEngine.generate() would spin forever. Fail loudly instead.
+            raise RuntimeError(
+                "Scheduler made no progress: "
+                f"{len(self.waiting)} waiting and {len(self.running)} running sequences, "
+                f"{len(self.block_manager.free_block_ids)} of "
+                f"{len(self.block_manager.blocks)} blocks free. "
+                "This means either a sequence that cannot fit in the KV cache, or "
+                "blocks leaked because their ref_count never returned to 0."
+            )
+
+        # a batch counts as prefill when it contains at least one prefill
+        # chunk: the model runner then runs the unified eager path
+        return scheduled_sequences, any(s.stage == SequenceStage.PREFILL for s in scheduled_sequences)
+
+    # try schedule for completion from running queue, one token per sequence
+    def _schedule_decode(self, scheduled_sequences, current_scheduled_tokens):
+        preempted = False
+        while self.running and len(scheduled_sequences) < self.max_num_sequences:
             seq = self.running.popleft()
             assert seq.stage == SequenceStage.DECODE, f"seq {seq.seq_id} (stage {seq.stage}) reached the decode loop"
             # use can_append to check whether we can append one more token
@@ -89,24 +112,39 @@ class ChunkedScheduler:
                 self.block_manager.append(seq)
                 scheduled_sequences.append(seq)
                 current_scheduled_tokens += 1 # only one token for completion
+        return preempted, current_scheduled_tokens
 
-        # re-add to running queue in the same order
-        if scheduled_sequences:
-            self.running.extendleft(reversed(scheduled_sequences))
-        elif not preempted and (self.waiting or self.running):
-            # Nothing was scheduled and nothing was preempted, so no engine state
-            # changed: every later schedule() would take the same decisions and
-            # LLMEngine.generate() would spin forever. Fail loudly instead.
-            raise RuntimeError(
-                "Scheduler made no progress: "
-                f"{len(self.waiting)} waiting and {len(self.running)} running sequences, "
-                f"{len(self.block_manager.free_block_ids)} of "
-                f"{len(self.block_manager.blocks)} blocks free. "
-                "This means either a sequence that cannot fit in the KV cache, or "
-                "blocks leaked because their ref_count never returned to 0."
-            )
-
-        return scheduled_sequences, False
+    # try schedule for chunked prefilling from waiting queue with the
+    # remaining token budget
+    # a prompt too large for one batch is prefilled in chunks: each chunk
+    # computes only its own tokens, and the sequence stays in WAITING (no
+    # token is generated) until the whole prompt has been computed
+    def _schedule_chunks(self, scheduled_sequences, current_scheduled_tokens):
+        while self.waiting and len(scheduled_sequences) < self.max_num_sequences:
+            seq = self.waiting[0]
+            # allocate all blocks up front on the first chunk (MVP simplification),
+            # later chunks only compute the remaining prompt tokens
+            if seq.num_computed_tokens == 0 and not self.block_manager.can_allocate(seq):
+                break
+            chunk_len = min(seq.num_uncomputed_prompt_tokens, self.max_num_batched_tokens - current_scheduled_tokens)
+            if chunk_len <= 0:
+                break
+            seq = self.waiting.popleft() # remove from waiting
+            if seq.num_computed_tokens == 0:
+                self.block_manager.allocate(seq)
+            # stamp the chunk size for this step: the model runner reads it to
+            # slice the chunk, postprocess() reads it to advance the cursor
+            seq.num_prefill_chunk_tokens = chunk_len
+            # INVARIANT: a scheduled prefill chunk is parked in `running` only
+            # for the duration of this step; postprocess() re-homes it before
+            # the next schedule() call. In pd_mixed mode the decode loop runs
+            # before any chunk is parked, so it never pops a PREFILL-stage
+            # sequence. In pure mode the decode loop is skipped entirely when
+            # chunks were scheduled, so the same holds.
+            self.running.append(seq)
+            scheduled_sequences.append(seq)
+            current_scheduled_tokens += chunk_len
+        return current_scheduled_tokens
 
 
     def preempt(self, seq: Sequence) -> None:

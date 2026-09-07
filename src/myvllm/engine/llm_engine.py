@@ -7,7 +7,7 @@ from typing import Any
 from myvllm.engine.model_runner import ModelRunner
 from myvllm.engine.scheduler import Scheduler
 from myvllm.engine.scheduler_chunked import ChunkedScheduler
-from myvllm.engine.sequence import Sequence
+from myvllm.engine.sequence import Sequence, SequenceStage
 from myvllm.sampling_parameters import SamplingParams
 from transformers import AutoTokenizer
 
@@ -51,13 +51,18 @@ class LLMEngine:
         # (see 实现chunked_prefill.md steps 3-5); the scheduler alone is not
         # enough for numerically correct output.
         scheduler_cls = ChunkedScheduler if config.get("enable_chunked_prefill", False) else Scheduler
-        self.scheduler = scheduler_cls(
+        scheduler_kwargs = dict(
             max_num_sequences=config.get("max_num_sequences", 16),
             max_num_batched_tokens=config.get("max_num_batched_tokens", 1024),
             max_cached_blocks=config.get("max_cached_blocks", 1024),
             block_size=config.get("block_size", 256),
-            eos=config.get("eos", 50256)
+            eos=config.get("eos", 50256),
         )
+        # P/D mixed scheduling only exists in the chunked scheduler; when
+        # disabled it falls back to pure batches (chunks first, decode waits)
+        if scheduler_cls is ChunkedScheduler:
+            scheduler_kwargs["pd_mixed"] = config.get("enable_pd_mixed", True)
+        self.scheduler = scheduler_cls(**scheduler_kwargs)
 
         atexit.register(self.exit)
 
@@ -85,9 +90,11 @@ class LLMEngine:
         outputs = outputs.cpu().tolist()
         # count before postprocess: it zeroes num_prefill_chunk_tokens
         if is_prefill:
-            # a chunked step processes its chunk; an unchunked (legacy) step
-            # processes the whole remaining prompt
+            # a chunked sequence counts its chunk, a decode sequence in a
+            # mixed batch counts one token, an unchunked (legacy) sequence
+            # counts the whole remaining prompt
             num_processed_tokens = sum(
+                1 if seq.stage == SequenceStage.DECODE else
                 seq.num_prefill_chunk_tokens if seq.num_prefill_chunk_tokens > 0 else len(seq) - seq.num_cached_tokens
                 for seq in scheduled_sequences
             )

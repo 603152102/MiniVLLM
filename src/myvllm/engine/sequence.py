@@ -48,6 +48,14 @@ class Sequence:
         # number of prompt tokens scheduled for prefill in the current step,
         # valid only between schedule() and postprocess() of that step
         self.num_prefill_chunk_tokens = 0
+        # speculative decoding state (only meaningful on the engine side and on
+        # worker runs that consume them; empty when spec is off):
+        # spec_token_ids: draft tokens proposed by the draft model, not yet
+        #   committed to token_ids (or committed-but-not-yet-cleared tail)
+        # num_spec_verified: how many of spec_token_ids already have target KV
+        #   written (accepted across verify; used to truncate after rollback)
+        self.spec_token_ids: list[int] = []
+        self.num_spec_verified: int = 0
 
     def __len__(self):
         return self.num_tokens
@@ -110,9 +118,46 @@ class Sequence:
     def append_token(self, token_id):
         self.token_ids.append(token_id)
         self.last_token = token_id
-        self.num_tokens += 1 
+        self.num_tokens += 1
+
+    # Commit a run of accepted tokens in one call (speculative verify commits
+    # n accepted drafts + a bonus/replacement token together). Mirrors
+    # append_token() for a list; block accounting is done separately by the
+    # BlockManager / scheduler after commit, as with single-token appends.
+    def append_tokens(self, token_ids: list[int]):
+        self.token_ids.extend(token_ids)
+        if token_ids:
+            self.last_token = token_ids[-1]
+        self.num_tokens += len(token_ids)
+
+    # Undo the last n committed completion tokens (discarding a bonus/replacement
+    # tail on EOS, or a failed commit). Prompt tokens are never rolled back.
+    def rollback_tokens(self, n: int):
+        assert 0 <= n <= self.num_completion_tokens, (
+            f"rollback_tokens({n}) exceeds completion tokens "
+            f"({self.num_completion_tokens})"
+        )
+        if n == 0:
+            return
+        self.num_tokens -= n
+        del self.token_ids[self.num_tokens:]
+        self.last_token = self.token_ids[-1] if self.token_ids else None
+
+    # (Re)store the pending draft buffer. Called after propose() fills it and
+    # after commit/rollback truncates it. keep_verified = number of leading
+    # spec tokens whose target KV is already valid (survives an accept).
+    def set_spec_buffer(self, token_ids: list[int], num_verified: int = 0):
+        self.spec_token_ids = token_ids
+        self.num_spec_verified = num_verified
+
+    def clear_spec_buffer(self):
+        self.spec_token_ids = []
+        self.num_spec_verified = 0
 
     def __getstate__(self):
+        # spec_token_ids must cross the shared-memory boundary in full even on
+        # the decode branch (where token_ids is minimized to last_token): the
+        # worker needs the pending draft tokens to build the verify input.
         return (
             self.num_tokens,
             self.num_prompt_tokens,
@@ -121,7 +166,9 @@ class Sequence:
             self.stage,
             self.num_prefill_chunk_tokens,
             self.block_table,
-            self.token_ids if self.num_completion_tokens == 0 else self.last_token
+            self.token_ids if self.num_completion_tokens == 0 else self.last_token,
+            self.spec_token_ids,
+            self.num_spec_verified,
         )
 
     def __setstate__(self, state):
@@ -133,7 +180,9 @@ class Sequence:
             self.stage,
             self.num_prefill_chunk_tokens,
             self.block_table,
-            last_token_or_ids
+            last_token_or_ids,
+            self.spec_token_ids,
+            self.num_spec_verified,
         ) = state
         # Check if this is prefill (num_completion_tokens == 0) or decode phase
         num_completion_tokens = self.num_tokens - self.num_prompt_tokens

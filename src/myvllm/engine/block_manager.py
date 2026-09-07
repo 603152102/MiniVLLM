@@ -158,3 +158,83 @@ class BlockManager:
         else:
             assert last_block_for_seq_id in self.used_block_ids, "Last block should be allocated"
             assert self.blocks[last_block_for_seq_id].hash == -1, "Last block should be partial block with hash -1"
+
+    # Number of blocks a sequence owns at a decode-step rest boundary for a given
+    # token count L. The engine allocates a block lazily: the block covering a
+    # token that is the first of a new block is only allocated when the *next*
+    # decode token is scheduled, so a just-committed length with L % size == 1
+    # has one fewer block than ceil(L/size).
+    def _rest_block_count(self, num_tokens: int) -> int:
+        if num_tokens == 0:
+            return 0
+        if num_tokens % self.block_size == 1:
+            return num_tokens // self.block_size
+        return -(-num_tokens // self.block_size)  # ceil
+
+    # Undo the block accounting for a provisional run (speculative verify).
+    #
+    # Caller must already have truncated the sequence to the accepted prefix:
+    # seq.num_tokens == accepted length and seq.token_ids holds only the accepted
+    # tokens (Sequence.rollback_tokens). This frees any trailing blocks that were
+    # allocated only by the rolled-back tokens and restores the trailing block to
+    # a consistent content/hash, so a subsequent decode/verify can continue as if
+    # the provisional run never happened.
+    #
+    # It only ever touches this sequence's private tail blocks (ref_count 1 in the
+    # decode/verify path). Earlier blocks keep their ids, so their KV cache slots
+    # stay where they are. KV of rolled-back slots is not cleared -- attention
+    # reads only up to the sequence length, so stale KV is harmless and the slots
+    # are overwritten when reallocated (prefix caching is off during MVP).
+    def rollback(self, seq: Sequence) -> None:
+        L = seq.num_tokens
+        if L > len(seq.token_ids):
+            raise ValueError(
+                f"rollback: seq.num_tokens {L} exceeds token_ids "
+                f"{len(seq.token_ids)}; truncate the sequence first"
+            )
+        target = self._rest_block_count(L)
+        # free trailing blocks no longer needed (only whole blocks allocated by
+        # the provisional run can land past `target`)
+        while len(seq.block_table) > target:
+            block = self.blocks[seq.block_table.pop()]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block.block_id)
+        seq.num_cached_tokens = 0
+        if L == 0:
+            return
+        # reconcile the trailing block against the accepted content
+        last = self.blocks[seq.block_table[-1]]
+        if L % self.block_size == 0:
+            # accepted prefix ends on a block boundary: the trailing block is full
+            # and must carry exactly the accepted slice so future prefix-cache
+            # matching (and append()'s "previous block finalized" assert) see the
+            # real content, not a slice that included rolled-back tokens
+            nb = L // self.block_size
+            full_tokens = seq.token_ids[(nb - 1) * self.block_size : L]
+            h = self.compute_hash(
+                full_tokens,
+                prefix_hash_value=(
+                    -1
+                    if len(seq.block_table) == 1
+                    else self.blocks[seq.block_table[-2]].hash
+                ),
+            )
+            if last.hash != h or last.token_ids != full_tokens:
+                if last.hash in self.hash_to_block_id and self.hash_to_block_id[last.hash] == last.block_id:
+                    del self.hash_to_block_id[last.hash]
+                last.update(h, full_tokens)
+                self.hash_to_block_id[h] = last.block_id
+        else:
+            # accepted prefix ends mid-block: the trailing block is partial and
+            # must not look finalized (a rolled-back token may have completed it).
+            # If a rolled-back token had completed it (finalized during the
+            # provisional run) its stored content/hash now includes rolled-back
+            # tokens; reset both so it looks like a never-finalized partial block
+            # again (the engine's decode path never fills block.token_ids for a
+            # partial block).
+            if last.hash != -1:
+                if self.hash_to_block_id.get(last.hash) == last.block_id:
+                    del self.hash_to_block_id[last.hash]
+                last.hash = -1
+                last.token_ids = []

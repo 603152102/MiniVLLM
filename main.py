@@ -40,6 +40,9 @@ config = {
     'eos': 151645,  # Fixed: should match tokenizer.eos_token_id
 
     'enable_chunked_prefill':False,
+    # P/D mixed scheduling (only applies when enable_chunked_prefill=True):
+    # True = decode 与 prefill chunk 同批（decode 优先），False = 纯批（chunk 优先，decode 等下一批）
+    'enable_pd_mixed':True,
 }
 
 def main():

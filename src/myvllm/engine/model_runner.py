@@ -9,7 +9,7 @@ from multiprocessing.shared_memory import SharedMemory
 from myvllm.models.qwen3 import Qwen3ForCausalLM
 #from myvllm.models.llama import LlamaForCausalLM
 from myvllm.layers.sampler import SamplerLayer
-from myvllm.engine.sequence import Sequence
+from myvllm.engine.sequence import Sequence, SequenceStage
 from myvllm.utils import *
 
 class ModelRunner:
@@ -307,11 +307,13 @@ class ModelRunner:
 
     # given seqs
     # prepare the data needed for a prefill forward pass
-    # taking prefix cache and chunked prefill into consideration:
-    # input_ids, positions, cu_seqlens_q/k, slot_mapping (where to write new KV values), block_tables (where to read KV values)
-    # for chunked prefill each sequence computes only the chunk stamped in
-    # num_prefill_chunk_tokens; a stamp of 0 means no chunking (legacy
-    # scheduler / warmup), so the rest of the prompt is computed in one pass
+    # taking prefix cache, chunked prefill and P/D mixed batches into
+    # consideration: input_ids, positions, cu_seqlens_q/k, slot_mapping
+    # (where to write new KV values), block_tables (where to read KV values)
+    # a PREFILL-stage sequence computes only the chunk stamped in
+    # num_prefill_chunk_tokens (a stamp of 0 means no chunking: legacy
+    # scheduler / warmup, the rest of the prompt is computed in one pass);
+    # a DECODE-stage sequence contributes one token, like prepare_decode
     # cu_seqlens_q = [0, 3, 5, 9]
     #               │  │  │  │
     #               │  │  │  └─ end of seq3 (position 9)
@@ -337,6 +339,21 @@ class ModelRunner:
         # block_tables: num_seqs x num_blocks (padded)
         block_tables = []
         for seq in seqs:
+            if seq.stage == SequenceStage.DECODE:
+                # decode sequence in a mixed batch: one new token per
+                # sequence. Semantics identical to prepare_decode: context
+                # length = len(seq) (attention excludes the new token itself)
+                # and position = len(seq) - 1
+                input_ids.append(seq.last_token)
+                positions.append(len(seq) - 1)
+                seqlens_q.append(1)
+                seqlens_k.append(len(seq))
+                cu_seqlens_q.append(cu_seqlens_q[-1] + 1)
+                cu_seqlens_k.append(cu_seqlens_k[-1] + seqlens_k[-1])
+                if seq.block_table:
+                    t = len(seq)
+                    slot_mappings.append(seq.block_table[t // self.block_size] * self.block_size + t % self.block_size)
+                continue
             token_ids = seq.token_ids
             start = seq.num_cached_tokens + seq.num_computed_tokens
             if seq.num_prefill_chunk_tokens > 0:
